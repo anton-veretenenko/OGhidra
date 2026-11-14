@@ -76,6 +76,7 @@ import java.nio.charset.StandardCharsets;
 import java.util.*;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.atomic.AtomicBoolean;
+import java.util.concurrent.atomic.AtomicReference;
 
 @PluginInfo(status = PluginStatus.RELEASED, packageName = ghidra.app.DeveloperPluginPackage.NAME, category = PluginCategoryNames.ANALYSIS, shortDescription = "OGhidraMCP - Extended HTTP server plugin", description = "Extended GhidraMCP by LaurieWired, modified by ezrealenoch. "
         +
@@ -1240,6 +1241,11 @@ public class GhidraMCPPlugin extends Plugin {
 
     /**
      * Save the current program (analysis database) to its project.
+     *
+     * CreateFunctionCmd schedules a background Auto Analysis task; calling
+     * save in the same instant fails with "Unable to lock due to active
+     * transaction".  Retry briefly on the HTTP thread (never sleeping on the
+     * Swing EDT) so create_function followed by save_program works.
      */
     private boolean saveCurrentProgram() {
         Program program = getCurrentProgram();
@@ -1247,22 +1253,42 @@ public class GhidraMCPPlugin extends Plugin {
             return false;
         }
 
-        AtomicBoolean success = new AtomicBoolean(false);
-        try {
-            SwingUtilities.invokeAndWait(() -> {
-                try {
-                    program.save("Saved by GhidraMCP HTTP request",
-                            new ConsoleTaskMonitor());
-                    success.set(true);
-                } catch (Exception e) {
-                    Msg.error(this, "Failed to save program", e);
-                }
-            });
-        } catch (InterruptedException | InvocationTargetException e) {
-            Msg.error(this, "Failed to execute save program on Swing thread", e);
+        for (int attempt = 0; attempt < 30; attempt++) {
+            AtomicBoolean saved = new AtomicBoolean(false);
+            AtomicReference<Exception> failure = new AtomicReference<>();
+            try {
+                SwingUtilities.invokeAndWait(() -> {
+                    try {
+                        program.save("Saved by GhidraMCP HTTP request",
+                                new ConsoleTaskMonitor());
+                        saved.set(true);
+                    } catch (Exception e) {
+                        failure.set(e);
+                    }
+                });
+            } catch (InterruptedException | InvocationTargetException e) {
+                Msg.error(this, "Failed to execute save program on Swing thread", e);
+                return false;
+            }
+
+            if (saved.get()) {
+                return true;
+            }
+            String message = String.valueOf(failure.get());
+            if (!message.contains("active transaction")) {
+                Msg.error(this, "Failed to save program", failure.get());
+                return false;
+            }
+            try {
+                Thread.sleep(100);
+            } catch (InterruptedException e) {
+                Thread.currentThread().interrupt();
+                return false;
+            }
         }
 
-        return success.get();
+        Msg.error(this, "Failed to save program: program stayed busy after retries");
+        return false;
     }
 
     /**

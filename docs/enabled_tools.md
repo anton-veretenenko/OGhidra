@@ -82,6 +82,19 @@ Renames a function by its address.
 ### `rename_data(address, new_name)`
 Renames a data label at the specified address.
 
+### `create_function(address, name="", disassemble_first=True)`
+Creates a function at an address that is not part of an existing function.
+With `disassemble_first=true` (the default) the entry flow is decoded first,
+which allows creating a function over raw undefined bytes; the body is then
+computed by Ghidra's `CreateFunctionCmd`.  An optional `name` is applied with
+`SourceType.USER_DEFINED`.  This is the on-demand equivalent of REA's
+pre-analysis function seeds.
+
+### `save_program()`
+Saves the current program's analysis database (names, comments, types) to its
+project.  Edits made through the HTTP API are otherwise only in memory until
+the analyst saves the project manually.
+
 ## System Tools
 
 ### `health_check()`

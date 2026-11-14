@@ -36,7 +36,10 @@ import ghidra.app.plugin.PluginCategoryNames;
 import ghidra.app.services.CodeViewerService;
 import ghidra.app.services.ProgramManager;
 import ghidra.app.util.PseudoDisassembler;
+import ghidra.app.cmd.disassemble.DisassembleCommand;
+import ghidra.app.cmd.function.CreateFunctionCmd;
 import ghidra.app.cmd.function.SetVariableNameCmd;
+import ghidra.program.model.address.AddressSet;
 import ghidra.program.model.symbol.SourceType;
 import ghidra.program.model.listing.LocalVariableImpl;
 import ghidra.program.model.listing.ParameterImpl;
@@ -405,6 +408,29 @@ public class GhidraMCPPlugin extends Plugin {
             int length = parseIntOrDefault(qparams.get("length"), 16);
             String format = qparams.getOrDefault("format", "hex");
             sendResponse(exchange, readBytesFromAddress(address, length, format));
+        });
+
+        // Create a function over an address that auto-analysis left undefined.
+        // Optional name; disassemble_first defaults to true (same as REA seeds).
+        server.createContext("/create_function", exchange -> {
+            Map<String, String> params = parsePostParams(exchange);
+            String address = params.get("address");
+            String name = params.get("name");
+            boolean disassembleFirst = !"false".equalsIgnoreCase(
+                    params.getOrDefault("disassemble_first", "true"));
+            boolean success = createFunctionAt(address, name, disassembleFirst);
+            sendResponse(exchange, success
+                    ? "Function created successfully"
+                    : "Failed to create function");
+        });
+
+        // Persist the analysis database (names, comments, types).  Without
+        // this, edits live only in memory until the analyst saves the project.
+        server.createContext("/save_program", exchange -> {
+            boolean success = saveCurrentProgram();
+            sendResponse(exchange, success
+                    ? "Program saved successfully"
+                    : "Failed to save program");
         });
 
         server.setExecutor(null);
@@ -1141,6 +1167,102 @@ public class GhidraMCPPlugin extends Plugin {
         } finally {
             program.endTransaction(tx, success.get());
         }
+    }
+
+    /**
+     * Create a function at an address that is not part of any function yet.
+     *
+     * This is the on-demand counterpart of Ghidra's "Create Function"
+     * action and of REA's pre-analysis function seeds: the entry address is
+     * disassembled first (unless disassemble_first=false), then
+     * CreateFunctionCmd computes the body.  An optional name is applied
+     * afterwards with USER_DEFINED source, exactly like the rename path.
+     */
+    private boolean createFunctionAt(String addressStr, String name, boolean disassembleFirst) {
+        Program program = getCurrentProgram();
+        if (program == null || addressStr == null || addressStr.isEmpty()) {
+            return false;
+        }
+
+        AtomicBoolean success = new AtomicBoolean(false);
+        try {
+            SwingUtilities.invokeAndWait(() -> {
+                int tx = program.startTransaction("Create function via HTTP");
+                try {
+                    Address addr = program.getAddressFactory()
+                            .getDefaultAddressSpace().getAddress(addressStr);
+                    if (program.getFunctionManager().getFunctionAt(addr) != null) {
+                        Msg.warn(this, "Function already exists at " + addressStr);
+                        return;
+                    }
+
+                    if (disassembleFirst
+                            && program.getListing().getInstructionAt(addr) == null) {
+                        AddressSet range = new AddressSet(addr, addr);
+                        DisassembleCommand dis =
+                                new DisassembleCommand(range, null, true);
+                        if (!dis.applyTo(program, new ConsoleTaskMonitor())) {
+                            Msg.error(this, "Failed to disassemble at " + addressStr
+                                    + ": " + dis.getStatusMsg());
+                            return;
+                        }
+                    }
+
+                    CreateFunctionCmd cmd = new CreateFunctionCmd(addr);
+                    if (!cmd.applyTo(program, new ConsoleTaskMonitor())) {
+                        Msg.error(this, "Failed to create function at " + addressStr
+                                + ": " + cmd.getStatusMsg());
+                        return;
+                    }
+
+                    Function func = program.getFunctionManager().getFunctionAt(addr);
+                    if (func == null) {
+                        Msg.error(this, "Function creation reported success but no "
+                                + "function exists at " + addressStr);
+                        return;
+                    }
+                    if (name != null && !name.isEmpty()) {
+                        func.setName(name, SourceType.USER_DEFINED);
+                    }
+                    success.set(true);
+                } catch (Exception e) {
+                    Msg.error(this, "Error creating function at " + addressStr, e);
+                } finally {
+                    program.endTransaction(tx, success.get());
+                }
+            });
+        } catch (InterruptedException | InvocationTargetException e) {
+            Msg.error(this, "Failed to execute create function on Swing thread", e);
+        }
+
+        return success.get();
+    }
+
+    /**
+     * Save the current program (analysis database) to its project.
+     */
+    private boolean saveCurrentProgram() {
+        Program program = getCurrentProgram();
+        if (program == null) {
+            return false;
+        }
+
+        AtomicBoolean success = new AtomicBoolean(false);
+        try {
+            SwingUtilities.invokeAndWait(() -> {
+                try {
+                    program.save("Saved by GhidraMCP HTTP request",
+                            new ConsoleTaskMonitor());
+                    success.set(true);
+                } catch (Exception e) {
+                    Msg.error(this, "Failed to save program", e);
+                }
+            });
+        } catch (InterruptedException | InvocationTargetException e) {
+            Msg.error(this, "Failed to execute save program on Swing thread", e);
+        }
+
+        return success.get();
     }
 
     /**

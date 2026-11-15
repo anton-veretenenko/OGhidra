@@ -39,6 +39,7 @@ import ghidra.app.util.PseudoDisassembler;
 import ghidra.app.cmd.disassemble.DisassembleCommand;
 import ghidra.app.cmd.function.CreateFunctionCmd;
 import ghidra.app.cmd.function.SetVariableNameCmd;
+import ghidra.app.plugin.core.analysis.AutoAnalysisManager;
 import ghidra.program.model.block.BasicBlockModel;
 import ghidra.program.model.block.CodeBlock;
 import ghidra.program.model.block.CodeBlockIterator;
@@ -561,13 +562,17 @@ public class GhidraMCPPlugin extends Plugin {
         });
 
         server.createContext("/undo", exchange -> {
+            Map<String, String> params = parsePostParams(exchange);
+            boolean includeAnalysis = "true".equalsIgnoreCase(
+                    trimToEmpty(params.get("include_analysis")));
             sendResponse(exchange, undoRedo(true,
-                    parseIntOrDefault(parsePostParams(exchange).get("steps"), 1)));
+                    parseIntOrDefault(params.get("steps"), 1), includeAnalysis));
         });
 
         server.createContext("/redo", exchange -> {
+            Map<String, String> params = parsePostParams(exchange);
             sendResponse(exchange, undoRedo(false,
-                    parseIntOrDefault(parsePostParams(exchange).get("steps"), 1)));
+                    parseIntOrDefault(params.get("steps"), 1), true));
         });
 
         server.createContext("/undo_state", exchange -> {
@@ -2338,34 +2343,67 @@ public class GhidraMCPPlugin extends Plugin {
         if (program == null) {
             return false;
         }
-        // Auto Analysis runs in its own transaction; starting a write inside
-        // it would make this an inner entry whose endTransaction() reports
-        // NOT_DONE even though the change is committed with the outer one.
-        waitForIdleTransaction(program, 3000);
-        AtomicBoolean success = new AtomicBoolean(false);
+        // Auto Analysis owns a transaction on its own thread.  Starting our
+        // write next to it would make this a nested entry: endTransaction()
+        // reports NOT_DONE and the undo entry is swallowed by the outer
+        // transaction.  Check for an idle transaction inside the EDT block
+        // (as close to startTransaction as possible) and retry on the HTTP
+        // thread instead of nesting.
+        // Let pending Auto Analysis finish before we open our transaction.
+        // waitForAnalysis() is safe off the analysis thread: in a headed tool
+        // it queues a worker and blocks this HTTP thread until analysis is idle.
         try {
-            SwingUtilities.invokeAndWait(() -> {
-                int tx = program.startTransaction(name);
-                boolean ok = false;
-                try {
-                    ok = body.run(program);
-                } catch (Exception e) {
-                    Msg.error(this, "Error in " + name, e);
-                } finally {
-                    boolean committed = program.endTransaction(tx, ok);
-                    // A nested entry commits with its parent, which is still
-                    // open here, so endTransaction() returns false for it.
-                    boolean nested = program.getCurrentTransactionInfo() != null;
-                    if (!committed && nested) {
-                        Msg.warn(this, name + " committed inside an outer transaction");
-                    }
-                    success.set(ok && (committed || nested));
-                }
-            });
-        } catch (InterruptedException | InvocationTargetException e) {
-            Msg.error(this, "Failed to execute " + name + " on Swing thread", e);
+            AutoAnalysisManager analysisManager = AutoAnalysisManager.getAnalysisManager(program);
+            if (analysisManager != null) {
+                analysisManager.waitForAnalysis(null, new ConsoleTaskMonitor());
+            }
+        } catch (RuntimeException e) {
+            Msg.warn(this, "waitForAnalysis before " + name + " failed: " + e);
         }
-        return success.get();
+
+        long deadline = System.currentTimeMillis() + 5000;
+        while (true) {
+            AtomicBoolean busy = new AtomicBoolean(false);
+            AtomicBoolean success = new AtomicBoolean(false);
+            try {
+                SwingUtilities.invokeAndWait(() -> {
+                    if (program.getCurrentTransactionInfo() != null) {
+                        busy.set(true);
+                        return;
+                    }
+                    int tx = program.startTransaction(name);
+                    boolean ok = false;
+                    try {
+                        ok = body.run(program);
+                    } catch (Exception e) {
+                        Msg.error(this, "Error in " + name, e);
+                    } finally {
+                        boolean committed = program.endTransaction(tx, ok);
+                        boolean nested = program.getCurrentTransactionInfo() != null;
+                        if (!committed && nested) {
+                            Msg.warn(this, name + " committed inside an outer transaction");
+                        }
+                        success.set(ok && (committed || nested));
+                    }
+                });
+            } catch (InterruptedException | InvocationTargetException e) {
+                Msg.error(this, "Failed to execute " + name + " on Swing thread", e);
+                return false;
+            }
+            if (!busy.get()) {
+                return success.get();
+            }
+            if (System.currentTimeMillis() >= deadline) {
+                Msg.warn(this, "REFUSED: program stayed busy; " + name + " was not applied");
+                return false;
+            }
+            try {
+                Thread.sleep(50);
+            } catch (InterruptedException e) {
+                Thread.currentThread().interrupt();
+                return false;
+            }
+        }
     }
 
     private void waitForIdleTransaction(Program program, long timeoutMs) {
@@ -2448,7 +2486,10 @@ public class GhidraMCPPlugin extends Plugin {
             if (listing.getInstructionAt(addr) != null) {
                 listing.clearCodeUnits(addr, end, false);
             }
-            DisassembleCommand cmd = new DisassembleCommand(new AddressSet(addr, end), null, followFlow);
+            AddressSet range = new AddressSet(addr, end);
+            // The restricted set keeps the decoder inside the requested bytes;
+            // with a null restricted set zero runs are decoded far beyond it.
+            DisassembleCommand cmd = new DisassembleCommand(range, range, followFlow);
             // Never kick off Auto Analysis from a listing request: the analysis
             // task commits asynchronously and leaves endTransaction() reporting
             // an incomplete status even though the code was already written.
@@ -2462,8 +2503,8 @@ public class GhidraMCPPlugin extends Plugin {
         StringBuilder sb = new StringBuilder();
         sb.append(ok ? "Disassembled" : "Failed to disassemble")
                 .append(" at ").append(addr)
-                .append(" (").append(length).append(" byte(s), follow_flow=").append(followFlow)
-                .append(", ").append(disassembled.get()).append(" byte(s) decoded)");
+                .append(" (").append(length).append(" byte(s) requested, follow_flow=")
+                .append(followFlow).append(", ").append(disassembled.get()).append(" decoded)");
         if (!status.get().isEmpty()) {
             sb.append(": ").append(status.get());
         }
@@ -3141,7 +3182,7 @@ public class GhidraMCPPlugin extends Plugin {
         return paginateList(lines, offset, limit);
     }
 
-    private String undoRedo(boolean undo, int steps) {
+    private String undoRedo(boolean undo, int steps, boolean includeAnalysis) {
         Program program = getCurrentProgram();
         if (program == null) {
             return "No program loaded";
@@ -3150,6 +3191,7 @@ public class GhidraMCPPlugin extends Plugin {
         List<String> names = new ArrayList<>();
         AtomicReference<String> failure = new AtomicReference<>();
         waitForIdleTransaction(program, 3000);
+        AtomicInteger skipped = new AtomicInteger(0);
         try {
             SwingUtilities.invokeAndWait(() -> {
                 for (int i = 0; i < maxSteps; i++) {
@@ -3157,6 +3199,22 @@ public class GhidraMCPPlugin extends Plugin {
                         break;
                     }
                     String name = undo ? program.getUndoName() : program.getRedoName();
+                    if (undo && !includeAnalysis && name != null && name.startsWith("Auto Analysis")) {
+                        // Auto Analysis commits its own transaction after our
+                        // write; skip it so /undo reaches the caller's edit.
+                        try {
+                            program.undo();
+                            skipped.incrementAndGet();
+                            i--;
+                            if (skipped.get() > 40) {
+                                break;
+                            }
+                            continue;
+                        } catch (IOException | RuntimeException e) {
+                            failure.set(e.toString());
+                            break;
+                        }
+                    }
                     try {
                         if (undo) {
                             program.undo();
@@ -3180,8 +3238,11 @@ public class GhidraMCPPlugin extends Plugin {
         if (names.isEmpty()) {
             return undo ? "Nothing to undo" : "Nothing to redo";
         }
+        String suffix = skipped.get() > 0
+                ? " (also skipped " + skipped.get() + " Auto Analysis transaction(s))"
+                : "";
         return (undo ? "Undid " : "Redid ") + names.size() + " transaction(s): "
-                + String.join(" | ", names);
+                + String.join(" | ", names) + suffix;
     }
 
     private String undoState() {

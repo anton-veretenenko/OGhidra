@@ -2338,6 +2338,10 @@ public class GhidraMCPPlugin extends Plugin {
         if (program == null) {
             return false;
         }
+        // Auto Analysis runs in its own transaction; starting a write inside
+        // it would make this an inner entry whose endTransaction() reports
+        // NOT_DONE even though the change is committed with the outer one.
+        waitForIdleTransaction(program, 3000);
         AtomicBoolean success = new AtomicBoolean(false);
         try {
             SwingUtilities.invokeAndWait(() -> {
@@ -2348,13 +2352,35 @@ public class GhidraMCPPlugin extends Plugin {
                 } catch (Exception e) {
                     Msg.error(this, "Error in " + name, e);
                 } finally {
-                    success.set(program.endTransaction(tx, ok) && ok);
+                    boolean committed = program.endTransaction(tx, ok);
+                    // A nested entry commits with its parent, which is still
+                    // open here, so endTransaction() returns false for it.
+                    boolean nested = program.getCurrentTransactionInfo() != null;
+                    if (!committed && nested) {
+                        Msg.warn(this, name + " committed inside an outer transaction");
+                    }
+                    success.set(ok && (committed || nested));
                 }
             });
         } catch (InterruptedException | InvocationTargetException e) {
             Msg.error(this, "Failed to execute " + name + " on Swing thread", e);
         }
         return success.get();
+    }
+
+    private void waitForIdleTransaction(Program program, long timeoutMs) {
+        long deadline = System.currentTimeMillis() + timeoutMs;
+        while (System.currentTimeMillis() < deadline) {
+            if (program.getCurrentTransactionInfo() == null) {
+                return;
+            }
+            try {
+                Thread.sleep(25);
+            } catch (InterruptedException e) {
+                Thread.currentThread().interrupt();
+                return;
+            }
+        }
     }
 
     private Address parseAddress(Program program, String text) {
@@ -2631,13 +2657,18 @@ public class GhidraMCPPlugin extends Plugin {
         }
         final DataType dataTypeToCreate = effective;
 
-        CodeUnit existing = program.getListing().getCodeUnitAt(addr);
-        if (existing != null && !overwrite) {
-            return "REFUSED: " + existing.getClass().getSimpleName() + " already defined at " + addr
-                    + " (" + existing + "). Pass overwrite=true with confirm/reason/evidence "
-                    + "to replace it.";
+        // getCodeUnitAt() also returns implicit undefined data ("??"), which
+        // must not count as existing markup.
+        Instruction existingInstruction = program.getListing().getInstructionAt(addr);
+        Data existingData = program.getListing().getDefinedDataAt(addr);
+        boolean hasExisting = existingInstruction != null || existingData != null;
+        CodeUnit existing = existingInstruction != null ? existingInstruction : existingData;
+        if (hasExisting && !overwrite) {
+            return "REFUSED: " + (existingInstruction != null ? "instruction" : "data")
+                    + " already defined at " + addr + " (" + existing
+                    + "). Pass overwrite=true with confirm/reason/evidence to replace it.";
         }
-        if (existing != null) {
+        if (hasExisting) {
             String refusal = destructiveGuard(params, "create_data (overwrite=true)");
             if (refusal != null) {
                 return refusal;
@@ -3118,6 +3149,7 @@ public class GhidraMCPPlugin extends Plugin {
         final int maxSteps = Math.max(1, Math.min(steps, 20));
         List<String> names = new ArrayList<>();
         AtomicReference<String> failure = new AtomicReference<>();
+        waitForIdleTransaction(program, 3000);
         try {
             SwingUtilities.invokeAndWait(() -> {
                 for (int i = 0; i < maxSteps; i++) {
@@ -3132,7 +3164,7 @@ public class GhidraMCPPlugin extends Plugin {
                             program.redo();
                         }
                         names.add(name == null ? "(unnamed)" : name);
-                    } catch (IOException e) {
+                    } catch (IOException | RuntimeException e) {
                         failure.set(e.toString());
                         break;
                     }

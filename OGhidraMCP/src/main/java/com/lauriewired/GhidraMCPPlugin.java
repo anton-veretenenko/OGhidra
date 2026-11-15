@@ -2416,21 +2416,28 @@ public class GhidraMCPPlugin extends Plugin {
         }
 
         AtomicReference<String> status = new AtomicReference<>("");
+        AtomicInteger disassembled = new AtomicInteger(0);
         boolean ok = inTransaction("Disassemble via HTTP", prog -> {
             Listing listing = prog.getListing();
             if (listing.getInstructionAt(addr) != null) {
                 listing.clearCodeUnits(addr, end, false);
             }
             DisassembleCommand cmd = new DisassembleCommand(new AddressSet(addr, end), null, followFlow);
+            // Never kick off Auto Analysis from a listing request: the analysis
+            // task commits asynchronously and leaves endTransaction() reporting
+            // an incomplete status even though the code was already written.
+            cmd.enableCodeAnalysis(false);
             boolean applied = cmd.applyTo(prog, new ConsoleTaskMonitor());
             status.set(trimToEmpty(cmd.getStatusMsg()));
+            disassembled.set((int) Math.min(Integer.MAX_VALUE, cmd.getDisassembledAddressSet().getNumAddresses()));
             return applied;
         });
 
         StringBuilder sb = new StringBuilder();
         sb.append(ok ? "Disassembled" : "Failed to disassemble")
                 .append(" at ").append(addr)
-                .append(" (").append(length).append(" byte(s), follow_flow=").append(followFlow).append(")");
+                .append(" (").append(length).append(" byte(s), follow_flow=").append(followFlow)
+                .append(", ").append(disassembled.get()).append(" byte(s) decoded)");
         if (!status.get().isEmpty()) {
             sb.append(": ").append(status.get());
         }
